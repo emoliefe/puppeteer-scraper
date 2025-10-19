@@ -1,221 +1,132 @@
+// server.js
 const express = require("express");
 const puppeteer = require("puppeteer");
 
 const app = express();
+
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.TOKEN || "";
 
-// Chrome yolu (Coolify/Puppeteer resmi imajı ile uyumlu)
+// Coolify/Puppeteer image için genelde gerekmez ama yine de destekleyelim
 const chromePath =
   process.env.PUPPETEER_EXECUTABLE_PATH ||
   (typeof puppeteer.executablePath === "function"
     ? puppeteer.executablePath()
     : undefined);
 
-// --- yardımcılar ---
+// ---------- küçük yardımcılar ----------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ok = (req) =>
   !TOKEN || req.query.token === TOKEN || req.header("x-token") === TOKEN;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const uniq = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
 
-function normDate(d) {
-  // 30.11.2025 veya 30/11/2025 -> 30.11.2025
-  if (!d) return "";
-  const m = d.match(/([0-3]?\d)[./]([01]?\d)[./](\d{4})/);
+function normDate(s) {
+  const m = String(s).match(/\b([0-3]?\d)[./]([0-1]?\d)[./](\d{4})\b/);
   if (!m) return "";
   return `${m[1].padStart(2, "0")}.${m[2].padStart(2, "0")}.${m[3]}`;
 }
 
-async function getInnerText(page) {
-  return page.evaluate(() => document.body.innerText || "");
+function extractDates(text) {
+  return uniq((text.match(/\b([0-3]?\d)\.([0-1]?\d)\.(\d{4})\b/g) || []).map(normDate));
 }
 
-async function waitPriceText(page, timeoutMs = 8000) {
-  const deadline = Date.now() + timeoutMs;
-  const PRICE_RE =
-    /(?:₺|\bTL\b)\s*\d{1,3}(?:[\.\s]\d{3})*(?:[.,]\d{2})?|\b\d{1,3}(?:[\.\s]\d{3})*(?:[.,]\d{2})?\s*(?:TL|₺)\b/i;
-
-  // 1) belirgin fiyat alanları
-  const hotSelectors = [
-    ".price,.fiyat,.tour-price,.calculated-price,.result-price,.total-price,[class*='price']",
-    "[id*='price']",
-  ];
-
-  while (Date.now() < deadline) {
-    // a) hızlı tarama
-    for (const s of hotSelectors) {
-      try {
-        const txt = await page.$eval(s, (el) => el.innerText.trim());
-        if (txt) {
-          const m = txt.match(PRICE_RE);
-          if (m) return m[0].replace(/\s+/g, " ").trim();
-        }
-      } catch (_) {}
-    }
-
-    // b) full body fallback
-    const body = await getInnerText(page);
-    const m = body.match(PRICE_RE);
-    if (m) return m[0].replace(/\s+/g, " ").trim();
-
-    await sleep(300);
-  }
-  return "";
-}
-
-// Ekranda görünür ve tıklanabilir mi?
-async function isVisibleClickable(page, handle) {
-  if (!handle) return false;
-  try {
-    const box = await handle.boundingBox();
-    if (!box || box.width < 2 || box.height < 2) return false;
-    const disabled = await page.evaluate(
-      (el) =>
-        el.hasAttribute("disabled") ||
-        el.getAttribute("aria-disabled") === "true" ||
-        el.classList.contains("disabled"),
-      handle
-    );
-    return !disabled;
-  } catch {
-    return false;
-  }
-}
-
-// Metinde geçen butonu (içerik) tıklama
-async function clickByText(page, texts, scopeSelector = null) {
-  return page.evaluate(
-    ({ texts, scopeSelector }) => {
-      const scope = scopeSelector
-        ? document.querySelector(scopeSelector)
-        : document;
-      if (!scope) return false;
-      const candidates = scope.querySelectorAll("button, a, [role='button']");
-      const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
-      const wants = texts.map(norm);
-
-      for (const el of candidates) {
-        const t = norm(el.innerText || el.textContent || "");
-        if (!t) continue;
-        if (wants.some((w) => t.includes(w))) {
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    },
-    { texts, scopeSelector }
+function extractPrices(text) {
+  return uniq(
+    (text.match(
+      /(?:₺|\bTL\b)\s*\d{2,6}(?:[.,]\d{2})?|\b\d{2,6}(?:[.,]\d{2})?\s*(?:TL|₺)\b/gi
+    ) || [])
+      .map((s) => s.replace(/\s+/g, " ").trim())
+      .filter((p) => !/^0+ ?(TL|₺)$/i.test(p))
   );
 }
 
-// Tarih inputunu/alanını aç
-async function openDatePicker(page) {
-  // 1) doğrudan input'a tıkla
-  const selectors = [
-    "input[placeholder*='Tarih' i]",
-    "input[name*='tarih' i]",
-    "#tarih, .tarih, [id*='tarih' i], [class*='tarih' i]",
-  ];
-  for (const s of selectors) {
-    const el = await page.$(s);
-    if (await isVisibleClickable(page, el)) {
-      await el.click({ delay: 20 }).catch(() => {});
-      await sleep(300);
-      return true;
-    }
-  }
-  // 2) yazıya tıkla
-  const ok = await clickByText(page, ["tarih seçiniz", "tarih", "tarihler"]);
-  if (ok) {
-    await sleep(300);
+// sayfa içi: görünen, tıklanabilir elementler arasından metne göre bul
+async function clickByText(page, text, scopeSelector = "body") {
+  const found = await page.evaluate(
+    (needle, scopeSel) => {
+      const scope = document.querySelector(scopeSel) || document.body;
+      const walker = document.createTreeWalker(scope, NodeFilter.SHOW_ELEMENT);
+      const candidates = [];
+      while (walker.nextNode()) {
+        const el = walker.currentNode;
+        const style = window.getComputedStyle(el);
+        if (
+          el.offsetParent !== null &&
+          style.visibility !== "hidden" &&
+          style.pointerEvents !== "none"
+        ) {
+          const t = (el.innerText || el.textContent || "").trim();
+          if (t && t.toLowerCase().includes(needle.toLowerCase())) {
+            candidates.push({
+              x: el.getBoundingClientRect().left + 2,
+              y: el.getBoundingClientRect().top + 2,
+            });
+          }
+        }
+      }
+      return candidates[0] || null;
+    },
+    text,
+    scopeSelector
+  );
+
+  if (found) {
+    await page.mouse.click(found.x, found.y);
     return true;
   }
   return false;
 }
 
-// Görünen takvim içindeki tıklanabilir gün düğmelerini bul
-async function getClickableDayLabels(page, max = 24) {
-  return page.evaluate((max) => {
-    const host =
-      document.querySelector(".ui-datepicker, .datepicker, .calendar, .date, [class*='calendar'], [id*='calendar']") ||
-      document.body;
-    const nodes = host.querySelectorAll("button, a, td, div, span");
-    const out = [];
-    for (const el of nodes) {
-      const style = window.getComputedStyle(el);
-      if (style.display === "none" || style.visibility === "hidden") continue;
-      if (
-        el.hasAttribute("disabled") ||
-        el.getAttribute("aria-disabled") === "true" ||
-        el.classList.contains("disabled")
-      )
-        continue;
-      const txt = (el.innerText || el.textContent || "").trim();
-      if (/^\d{1,2}$/.test(txt)) {
-        // sadece gün numarası
-        out.push({ text: txt });
-        if (out.length >= max) break;
-      }
+async function clickFirst(page, selectors) {
+  for (const sel of selectors) {
+    const handle = await page.$(sel);
+    if (handle) {
+      try {
+        await handle.click();
+        return true;
+      } catch (_) {}
     }
-    return out;
-  }, max);
+  }
+  return false;
 }
 
-// Takvimde belirli gün numarasını tıkla
-async function clickDayByText(page, dayText) {
-  return page.evaluate((dayText) => {
-    const host =
-      document.querySelector(".ui-datepicker, .datepicker, .calendar, .date, [class*='calendar'], [id*='calendar']") ||
-      document.body;
-
-    // Önce seçilebilir <button>/<a>
-    const candidates = host.querySelectorAll("button, a, td, div, span");
-    const norm = (s) => (s || "").trim();
-
-    for (const el of candidates) {
-      const txt = norm(el.innerText || el.textContent);
-      if (txt === String(dayText)) {
-        // disabled değilse tıkla
-        if (
-          !el.hasAttribute("disabled") &&
-          el.getAttribute("aria-disabled") !== "true" &&
-          !el.classList.contains("disabled")
-        ) {
-          el.click();
-          return true;
-        }
-      }
-    }
-    return false;
-  }, dayText);
-}
-
-// “HESAPLA” tuşuna bas
-async function clickHesapla(page) {
-  // önce görünen modal/alan içinde ara
-  const ok =
-    (await clickByText(page, ["hesapla"], ".modal, body")) ||
-    (await clickByText(page, ["fiyat", "fiyatları gör"], ".modal, body"));
-  await sleep(400);
-  return ok;
-}
-
-// Seçilmiş tarihi okumak için input değerini al
-async function readSelectedDate(page) {
-  const val = await page.evaluate(() => {
-    const el =
-      document.querySelector("input[placeholder*='Tarih' i]") ||
-      document.querySelector("input[name*='tarih' i]") ||
-      document.querySelector("#tarih");
-    return el && (el.value || el.getAttribute("value"));
+async function newBrowserPage(targetUrl) {
+  const browser = await puppeteer.launch({
+    headless: true,
+    executablePath: chromePath,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--window-size=1366,900",
+      // İstersen dil:
+      // "--lang=tr-TR",
+    ],
   });
-  return normDate(val || "");
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1366, height: 900 });
+  await page.setExtraHTTPHeaders({
+    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "User-Agent":
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131 Safari/537.36",
+  });
+
+  // Bazı sitelerde onay/çerez
+  page.on("dialog", async (d) => {
+    try {
+      await d.accept();
+    } catch {}
+  });
+
+  await page.goto(targetUrl, { waitUntil: "networkidle2", timeout: 180000 });
+  return { browser, page };
 }
 
-// ---- Sağlık
+// ---------- endpoints ----------
 app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// ---- Hızlı tarama (tıklamasız, mevcut /scrape)
+// hızlı: sadece metinden tarih/fiyat
 app.get("/scrape", async (req, res) => {
   if (!ok(req)) return res.status(401).json({ error: "unauthorized" });
   const url = (req.query.url || "").trim();
@@ -223,51 +134,25 @@ app.get("/scrape", async (req, res) => {
 
   let browser;
   try {
-    browser = await puppeteer.launch({
-      headless: true,
-      executablePath: chromePath,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--window-size=1366,900",
-        "--lang=tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-      ],
+    const ctx = await newBrowserPage(url);
+    browser = ctx.browser;
+    const page = ctx.page;
+
+    const txt = await page.evaluate(() => document.body.innerText || "");
+    res.json({
+      ok: true,
+      url,
+      dates: extractDates(txt),
+      prices: extractPrices(txt),
     });
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1366, height: 900 });
-    page.setDefaultTimeout(90000);
-
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 180000 });
-    const body = await getInnerText(page);
-
-    const dates = Array.from(
-      new Set(
-        (body.match(/\b([0-3]?\d)[.\/]([01]?\d)[.\/](\d{4})\b/g) || []).map(
-          (d) => normDate(d)
-        )
-      )
-    );
-
-    const prices = Array.from(
-      new Set(
-        (
-          body.match(
-            /(?:₺|\bTL\b)\s*\d{1,3}(?:[\.\s]\d{3})*(?:[.,]\d{2})?|\b\d{1,3}(?:[\.\s]\d{3})*(?:[.,]\d{2})?\s*(?:TL|₺)\b/gi
-          ) || []
-        ).map((s) => s.replace(/\s+/g, " ").trim())
-      )
-    );
-
-    res.json({ ok: true, url, dates, prices });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: String(e.message || e) });
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
 });
 
-// ---- Teşhis (opsiyonel)
+// teşhis: “aç/kapa düğmesi var mı, modal var mı, buton sayısı kaç?”
 app.get("/probe", async (req, res) => {
   if (!ok(req)) return res.status(401).json({ error: "unauthorized" });
   const url = (req.query.url || "").trim();
@@ -275,64 +160,214 @@ app.get("/probe", async (req, res) => {
 
   let browser;
   try {
-    browser = await puppeteer.launch({
-      headless: true,
-      executablePath: chromePath,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--window-size=1366,900",
-        "--lang=tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-      ],
+    const ctx = await newBrowserPage(url);
+    browser = ctx.browser;
+    const page = ctx.page;
+
+    // yaygın açıcılar
+    const openers = [
+      "button:has-text('Tüm Tarihler')",
+      "button:has-text('Tüm Tarihler ve Fiyatlar')",
+      "button:has-text('Tarihler')",
+      "a:has-text('Tüm Tarihler')",
+      "a:has-text('Tarihler')",
+      ".btn-dates,.btn-calendar,[class*='tarih']",
+    ];
+
+    let openerClicked = false;
+    for (const o of openers) {
+      const h = await page.$(o).catch(() => null);
+      if (h) {
+        try {
+          await h.click();
+          openerClicked = true;
+          break;
+        } catch {}
+      }
+    }
+    if (!openerClicked) {
+      // metinle dene
+      openerClicked = await clickByText(page, "Tarihler");
+      if (!openerClicked) openerClicked = await clickByText(page, "Tüm Tarihler");
+    }
+
+    await sleep(800);
+
+    const modalPresent = await page.$(".modal, [role='dialog']").then(Boolean).catch(() => false);
+
+    const txt = await page.evaluate(() => document.body.innerText || "");
+    const textDateNodes = extractDates(txt).length;
+
+    // sayfadaki görünür hesapla butonları kaba sayı
+    const hesaplaButtons = await page.evaluate(() => {
+      const labelHit = (n) =>
+        /hesapla|fiyat/i.test((n.innerText || n.textContent || "").trim());
+      return Array.from(document.querySelectorAll("button,a")).filter(labelHit)
+        .length;
     });
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1366, height: 900 });
-    page.setDefaultTimeout(90000);
-
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 180000 });
-
-    const openerClicked = await openDatePicker(page);
-    await sleep(400);
-
-    const dateCandidates = await getClickableDayLabels(page, 50);
-    const hesaplaExists = await clickByText(page, ["hesapla", "fiyat"]);
-    // geri almayalım; sadece var mı diye bastık
 
     res.json({
       ok: true,
       url,
       openerClicked,
-      modalPresent: false,
-      dateCandidates: dateCandidates.length,
-      hesaplaButtons: hesaplaExists ? 1 : 0,
+      modalPresent,
+      textDateNodes,
+      hesaplaButtons,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: String(e.message || e) });
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
 });
 
-// ---- Asıl akış: tarih seç → HESAPLA → fiyatı oku
-// /calc?url=...&token=efe123&limit=12
+// asıl akış: tarih tıkla → HESAPLA → çıkan fiyatı oku
+// /calc?url=...&token=...&limit=12
 app.get("/calc", async (req, res) => {
   if (!ok(req)) return res.status(401).json({ error: "unauthorized" });
   const url = (req.query.url || "").trim();
-  const limit = Math.max(1, Math.min(parseInt(req.query.limit || "18", 10), 36));
   if (!url) return res.status(400).json({ error: "URL eksik" });
+  const LIMIT = Math.max(1, Math.min(30, Number(req.query.limit) || 12));
 
   let browser;
-  const schedule = [];
-  const failed = [];
-
   try {
-    browser = await puppeteer.launch({
-      headless: true,
-      executablePath: chromePath,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--window-size=1366,900",
-        "--lang=tr-TR,tr;q=0.9
+    const ctx = await newBrowserPage(url);
+    browser = ctx.browser;
+    const page = ctx.page;
+
+    // Açılabilir “tarihler” paneli varsa aç
+    let openerClicked =
+      (await clickFirst(page, [
+        "button:has-text('Tüm Tarihler')",
+        "button:has-text('Tüm Tarihler ve Fiyatlar')",
+        "button:has-text('Tarihler')",
+        "a:has-text('Tarihler')",
+        "a:has-text('Tüm Tarihler')",
+        ".btn-dates,.btn-calendar,[class*='tarih']",
+      ])) ||
+      (await clickByText(page, "Tüm Tarihler")) ||
+      (await clickByText(page, "Tarihler"));
+    if (openerClicked) await sleep(700);
+
+    // Görünen tarih hücrelerinden aday topla
+    const candidates = await page.evaluate(() => {
+      const isVis = (el) =>
+        el.offsetParent !== null &&
+        window.getComputedStyle(el).visibility !== "hidden";
+
+      const set = new Set();
+      const push = (s) => set.add(s);
+
+      // modal içi
+      document
+        .querySelectorAll(
+          ".modal [data-date], .modal .day, .modal button, .modal a"
+        )
+        .forEach((el) => {
+          if (!isVis(el)) return;
+          const txt = (el.innerText || el.textContent || "").trim();
+          if (/\d{1,2}[./]\d{1,2}[./]\d{4}/.test(txt)) push(txt);
+          const d = el.getAttribute("data-date");
+          if (d) push(d);
+        });
+
+      // sayfa geneli
+      document.querySelectorAll("[data-date], .day, .date").forEach((el) => {
+        if (!isVis(el)) return;
+        const txt = (el.innerText || el.textContent || "").trim();
+        if (/\d{1,2}[./]\d{1,2}[./]\d{4}/.test(txt)) push(txt);
+        const d = el.getAttribute("data-date");
+        if (d) push(d);
+      });
+
+      // fallback: tüm metinden de ayıklayalım
+      const body = document.body.innerText || "";
+      (body.match(/\b([0-3]?\d)\.([0-1]?\d)\.(\d{4})\b/g) || []).forEach((s) =>
+        push(s)
+      );
+
+      return Array.from(set).slice(0, 60);
+    });
+
+    const dateList = uniq(candidates.map(normDate)).slice(0, LIMIT);
+
+    const schedule = [];
+    const failed = [];
+
+    // tek bir tarihe tıklayıp "Hesapla" → fiyat okuyan küçük rutin
+    async function handleOneDate(d) {
+      // tarihi içeren ilk görünen düğmeye “metinden” tıkla
+      const clicked = await clickByText(page, d);
+      if (!clicked) {
+        failed.push({ date: d, reason: "date_not_clickable" });
+        return;
+      }
+      await sleep(400);
+
+      // HESAPLA/Fiyat düğmesi
+      const pressed =
+        (await clickFirst(page, [
+          "button:has-text('Hesapla')",
+          "a:has-text('Hesapla')",
+          "button:has-text('Fiyat')",
+          "a:has-text('Fiyat')",
+        ])) ||
+        (await clickByText(page, "HESAPLA")) ||
+        (await clickByText(page, "Hesapla")) ||
+        (await clickByText(page, "Fiyat"));
+
+      if (pressed) {
+        // sonuçların yüklenmesi için kısa bekleme
+        await sleep(1000);
+      }
+
+      // fiyat okuma: önce belirgin alanlar, sonra gövde metni
+      const priceFromBoxes = await page
+        .evaluate(() => {
+          const pick = (n) =>
+            (n.innerText || n.textContent || "").replace(/\s+/g, " ").trim();
+          const nodes = document.querySelectorAll(
+            ".price, .fiyat, .tour-price, .calculated-price, .result-price, .total-price, [class*='price']"
+          );
+          for (const el of nodes) {
+            const t = pick(el);
+            const m = t.match(
+              /(?:₺|\bTL\b)\s*\d{2,6}(?:[.,]\d{2})?|\b\d{2,6}(?:[.,]\d{2})?\s*(?:TL|₺)\b/i
+            );
+            if (m) return m[0];
+          }
+          return "";
+        })
+        .catch(() => "");
+
+      let price = priceFromBoxes;
+      if (!price) {
+        const body = await page.evaluate(() => document.body.innerText || "");
+        price = extractPrices(body)[0] || "";
+      }
+
+      if (price) schedule.push({ date: d, price });
+      else failed.push({ date: d, reason: "price_not_found" });
+    }
+
+    for (const d of dateList) {
+      await handleOneDate(d);
+    }
+
+    // benzersizleştir
+    const uniqSchedule = uniq(schedule.map((x) => JSON.stringify(x))).map((s) =>
+      JSON.parse(s)
+    );
+
+    res.json({ ok: true, url, schedule: uniqSchedule, failed });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+});
+
+// ---- dinle ----
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("✅ Puppeteer servisi çalışıyor:", PORT);
+});
