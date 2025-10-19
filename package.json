@@ -4,6 +4,7 @@
   "main": "server.js",
   "license": "UNLICENSED",
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "puppeteer": "^23.6.0"
   }
 }
