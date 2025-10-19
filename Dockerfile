@@ -1,25 +1,43 @@
-# Resmi Puppeteer imajı (Chromium yüklü gelir)
-FROM ghcr.io/puppeteer/puppeteer:latest
+# Node 20 tabanlı imaj
+FROM node:20-slim
 
-# Küçük yardımcılar
+# Root yetkisiyle gerekli bağımlılıklar + Chromium kurulumu
 USER root
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl ca-certificates \
+  && apt-get install -y --no-install-recommends \
+     chromium \
+     fonts-liberation \
+     libasound2 \
+     libatk-bridge2.0-0 \
+     libatk1.0-0 \
+     libcups2 \
+     libdbus-1-3 \
+     libdrm2 \
+     libgbm1 \
+     libgtk-3-0 \
+     libnspr4 \
+     libnss3 \
+     libx11-xcb1 \
+     libxcomposite1 \
+     libxdamage1 \
+     libxfixes3 \
+     libxrandr2 \
+     xdg-utils \
+     curl \
   && rm -rf /var/lib/apt/lists/*
 
-# Uygulama dosyaları
+# Puppeteer ve Express kurulumu
 WORKDIR /app
 COPY package.json ./
-RUN npm i --omit=dev
+RUN npm install --omit=dev
+
 COPY server.js ./
 
-# Ortam
-ENV NODE_ENV=production
+# Ortam değişkenleri
 ENV PORT=3000
+ENV PUPPETEER_EXECUTABLE_PATH="/usr/bin/chromium"
+ENV NODE_ENV=production
+
 EXPOSE 3000
 
-# Puppeteer default kullanıcısına geri dön
-USER pptruser
-
-# Uygulamayı başlat
 CMD ["node", "server.js"]
