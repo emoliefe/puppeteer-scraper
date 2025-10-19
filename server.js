@@ -1,6 +1,9 @@
 // server.js
 const express = require("express");
 const puppeteer = require("puppeteer");
+// 🔧 Chromium yolunu garanti et
+const { executablePath } = require("puppeteer");
+const chromePath = executablePath();
 
 const app = express();
 
@@ -39,15 +42,18 @@ app.get("/scrape", async (req, res) => {
 
     const browser = await puppeteer.launch({
       headless: true,
+      // ✅ Puppeteer'ın içindeki Chromium'u kullan
+      executablePath: chromePath,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
         "--no-zygote",
-        "--single-process",
+        "--window-size=1366,900",
+        "--lang=tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
       ],
-      // puppeteer imajında Chromium yüklü geliyor
+      // timeout: 0 // (istersen sınırsız)
     });
 
     const page = await browser.newPage();
@@ -59,7 +65,7 @@ app.get("/scrape", async (req, res) => {
     );
     page.setDefaultTimeout(60_000);
 
-    await page.goto(url, { waitUntil: "networkidle2" });
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 120_000 });
 
     // 1) “Tüm Tarihler” butonunu açmayı dener (varsa)
     try {
@@ -92,7 +98,11 @@ app.get("/scrape", async (req, res) => {
         if (hesaplaBtns.length) {
           await hesaplaBtns[0].click();
           // Hesap sonrası istekler bitsin
-          await page.waitForNetworkIdle({ idleTime: 1000, timeout: 30_000 }).catch(() => {});
+          if (typeof page.waitForNetworkIdle === "function") {
+            await page.waitForNetworkIdle({ idleTime: 1000, timeout: 30_000 }).catch(() => {});
+          } else {
+            await page.waitForTimeout(1500);
+          }
         }
       } catch (_) {}
     }
@@ -110,13 +120,11 @@ app.get("/scrape", async (req, res) => {
     const allPrices = unique((text.match(priceRegex) || []).map(s => s.replace(/\s+/g, " ").trim()));
 
     // Eğer tek bir tarih seçildi ve “hesapla” yapıldıysa, dönen ilk fiyatı o tarihle eşleştir
-    // (Bu kısım hedef siteye göre özelleştirilebilir; gerekirse spesifik selector ver, birlikte netleştiririz.)
     let result = {
       clickedDate: clickedDate || null,
       dates: allDates,
       prices: allPrices,
     };
-
     if (clickedDate && allPrices.length) {
       result.datePrice = { [clickedDate]: allPrices[0] };
     }
