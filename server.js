@@ -3,28 +3,26 @@ const puppeteer = require("puppeteer");
 
 const app = express();
 
-const PORT = process.env.PORT || 3000;
+const PORT  = process.env.PORT  || 3000;
 const TOKEN = process.env.TOKEN || "";
 const chromePath =
   process.env.PUPPETEER_EXECUTABLE_PATH ||
   (typeof puppeteer.executablePath === "function" ? puppeteer.executablePath() : undefined);
 
-const ok = (req) => !TOKEN || req.query.token === TOKEN || req.header("x-token") === TOKEN;
-const uniq = (arr) => Array.from(new Set(arr || []));
+// -------- helpers ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const ok = (req) => !TOKEN || req.query.token === TOKEN || req.header("x-token") === TOKEN;
 
-function normDate(s) {
-  const m = s && s.match(/\b([0-3]?\d)[./]([0-1]?\d)[./](\d{4})\b/);
+const uniq = (arr) => Array.from(new Set(arr || []));
+const normDate = (s) => {
+  // 1.1.2025 → 01.01.2025
+  const m = (s || "").match(/\b([0-3]?\d)[./]([0-1]?\d)[./](\d{4})\b/);
   if (!m) return "";
-  const d = m[1].padStart(2, "0");
-  const mo = m[2].padStart(2, "0");
-  const y = m[3];
-  return `${d}.${mo}.${y}`;
-}
+  return `${String(m[1]).padStart(2,"0")}.${String(m[2]).padStart(2,"0")}.${m[3]}`;
+};
 
-async function launch() {
-  return puppeteer.launch({
-    protocol: "cdp",              // <-- klasik API
+async function ensurePage(url) {
+  const browser = await puppeteer.launch({
     headless: true,
     executablePath: chromePath,
     args: [
@@ -35,106 +33,188 @@ async function launch() {
       "--lang=tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
     ],
   });
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1366, height: 900 });
+  page.setDefaultTimeout(90000);
+
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 180000 }).catch(()=>{});
+
+  // çerez / KVKK kabul (varsa)
+  try {
+    // sık görülen buton metinleri
+    const cookieBtnXpath = [
+      "//button[contains(translate(., 'İI', 'ii'), 'kabul') or contains(translate(.,'OK','ok'),'ok')]",
+      "//button[contains(., 'Kabul Et')]",
+      "//button[contains(., 'Tamam')]",
+    ];
+    for (const xp of cookieBtnXpath) {
+      const btns = await page.$x(xp);
+      if (btns.length) { await btns[0].click().catch(()=>{}); await sleep(300); break; }
+    }
+  } catch {}
+
+  return { browser, page };
 }
 
-async function clickByText(page, texts = [], scope = null) {
-  // texts: ["Tüm Tarihler", "Tüm Tarihler ve Fiyatlar", "Hesapla", "Fiyat"]
-  const res = await page.evaluate(
-    ({ texts, scope }) => {
-      const root = scope ? document.querySelector(scope) : document;
-      if (!root) return false;
-      const candidates = Array.from(
-        root.querySelectorAll(
-          [
-            "button",
-            "a",
-            "[role='button']",
-            ".btn",
-            "[class*='btn']",
-            "div",
-            "span",
-            "label",
-          ].join(",")
-        )
-      );
-      const want = texts.map((t) => t.toLowerCase());
-      for (const el of candidates) {
-        const txt = (el.innerText || el.textContent || "").trim().toLowerCase();
-        if (!txt) continue;
-        if (want.some((t) => txt.includes(t))) {
-          el.click();
-          return true;
-        }
+async function scrollToTop(page){ await page.evaluate(() => window.scrollTo(0,0)); await sleep(200); }
+async function scrollIntoViewIfNeeded(page, el) {
+  try { await el.evaluate((node) => node.scrollIntoView({ block: "center", behavior: "instant" })); } catch {}
+  await sleep(120);
+}
+
+async function extractVisiblePrice(page) {
+  // sayfadaki görünür metinden makul bir fiyat ifadesi çek
+  const txt = await page.evaluate(() => document.body.innerText || "");
+  const re = /(?:₺|TL|€|EUR|USD)\s*\d{2,6}(?:[.,]\d{2})?|\b\d{2,6}(?:[.,]\d{2})?\s*(?:₺|TL|€|EUR|USD)\b/i;
+  const m = txt.match(re);
+  if (m) return m[0].replace(/\s+/g, " ").trim();
+
+  // belirgin fiyat alanları
+  const selectors = [
+    ".price", ".fiyat",
+    ".tour-price", ".calculated-price", ".result-price", ".total-price",
+    "[class*='price']"
+  ];
+  for (const s of selectors) {
+    try {
+      const val = await page.$eval(s, el => (getComputedStyle(el).display !== "none" ? el.innerText : "")).catch(()=> "");
+      if (val && /(₺|TL|€|EUR|USD)/.test(val)) {
+        const mm = val.match(re);
+        if (mm) return mm[0].replace(/\s+/g, " ").trim();
       }
-      return false;
-    },
-    { texts, scope }
-  );
-  return !!res;
-}
-
-async function waitPriceText(page, timeoutMs = 15000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const txt = await page.evaluate(() => document.body.innerText || "");
-    const m =
-      txt.match(
-        /(?:₺|\bTL\b|\bEUR\b|\bUSD\b)\s*\d{2,6}(?:[.,]\d{2})?|\b\d{2,6}(?:[.,]\d{2})?\s*(?:TL|₺|EUR|USD)\b/i
-      ) || txt.match(/\b\d{2,6}\s*₺\b/);
-    if (m) return m[0].replace(/\s+/g, " ").trim();
-    await sleep(400);
+    } catch {}
   }
   return "";
 }
 
-async function findDateButtons(page) {
-  // Modal varsa öncelikle orada ara
-  const hasModal = await page.evaluate(() => {
-    return !!document.querySelector(".modal.show,.modal[style*='display: block'],.modal.open,[class*='modal'][aria-hidden='false']");
-  });
-
-  const selectors = [
-    "[data-date]",
-    ".date",
-    ".day",
-    "button.date",
-    "a.date",
-    ".calendar button",
-    ".calendar a",
-    ".calendar [data-date]",
-  ];
-  const scope = hasModal ? ".modal.show, .modal[style*='display: block'], .modal.open" : null;
-
-  // 1) veri-öznitelikli veya sınıflı düğmeler
-  const handles = [];
-  for (const sel of selectors) {
-    const found = await page.$$(scope ? `${scope} ${sel}` : sel);
-    handles.push(...found);
-  }
-
-  // 2) Düğme yoksa düz metinden tarih geçen clickable node bul
-  const textNodes = await page.evaluateHandle((scopeSel) => {
-    const root = scopeSel ? document.querySelector(scopeSel) : document;
-    const nodes = [];
-    const all = Array.from(
-      root.querySelectorAll("button, a, [role='button'], .btn, [class*='btn'], div, span, label")
-    );
-    for (const el of all) {
-      const t = (el.innerText || el.textContent || "").trim();
-      if (/\b([0-3]?\d)[./]([0-1]?\d)[./](\d{4})\b/.test(t)) nodes.push(el);
+async function clickFirstHesapla(page) {
+  // Hem <button> hem <a> içinde "Hesapla" / "Fiyat" arar
+  const nodes = await page.$$(`button, a, .btn, [role="button"]`);
+  for (const n of nodes) {
+    const t = (await n.evaluate(el => (el.innerText || el.textContent || "").trim().toLowerCase())).replace(/\s+/g, " ");
+    if (!t) continue;
+    if (t.includes("hesapla") || t.includes("fiyat")) {
+      await scrollIntoViewIfNeeded(page, n);
+      await n.click().catch(()=>{});
+      return true;
     }
-    return nodes;
-  }, hasModal ? ".modal.show, .modal[style*='display: block'], .modal.open" : null);
-
-  const textNodeProps = await page.evaluate((arr) => arr.length, textNodes).catch(() => 0);
-
-  return { handles, hasModal, textNodeProps, textNodes };
+  }
+  // XPATH yedek
+  const xpath = [
+    "//button[contains(translate(normalize-space(.),'HESAPLA','hesapla'),'hesapla')]",
+    "//a[contains(translate(normalize-space(.),'HESAPLA','hesapla'),'hesapla')]",
+    "//button[contains(.,'Fiyat')]",
+    "//a[contains(.,'Fiyat')]",
+  ];
+  for (const xp of xpath) {
+    const b = await page.$x(xp);
+    if (b.length) { await scrollIntoViewIfNeeded(page, b[0]); await b[0].click().catch(()=>{}); return true; }
+  }
+  return false;
 }
 
-// ---------- health ----------
+async function findLavinyaDateElements(page) {
+  // Lavinya tarih kutuları: .tour-date-item içinde görünüyor.
+  // Bu fonksiyon her görünür tarih için {text, handle} döndürür.
+  const handles = await page.$$(
+    ".tour-date-item, .tour-date, [data-date], .calendar .day, .calendar button, .calendar a"
+  );
+
+  const list = [];
+  for (const h of handles) {
+    try {
+      const visible = await h.evaluate(el => {
+        const cs = getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        return cs && cs.display !== "none" && cs.visibility !== "hidden" && r.width > 0 && r.height > 0;
+      });
+      if (!visible) continue;
+
+      const label = await h.evaluate(el => (el.innerText || el.textContent || el.getAttribute("data-date") || "").trim());
+      const d = normDate(label);
+      if (d) list.push({ date: d, handle: h });
+    } catch {}
+  }
+
+  // Tekilleştir (aynı tarihi gösteren birden çok node olabilir)
+  const seen = new Set();
+  const out = [];
+  for (const item of list) {
+    if (!seen.has(item.date)) { seen.add(item.date); out.push(item); }
+  }
+  return out;
+}
+
+async function calcAllDates(page) {
+  // Ekrandaki tüm tarih kutularını bul
+  let dates = await findLavinyaDateElements(page);
+
+  // Eğer sayfada bulamadıysak, metinden yakala (ör. içerik bloklarında geçen tarih)
+  if (!dates.length) {
+    const textDates = await page.evaluate(() => {
+      const t = document.body.innerText || "";
+      return (t.match(/\b([0-3]?\d)\.([0-1]?\d)\.(\d{4})\b/g) || []);
+    });
+    const uniqDates = uniq(textDates.map(normDate));
+    // tıklanacak element ararken bu tarih metnini içeren bir düğme/hücre bulmayı deneriz
+    dates = uniqDates.map(d => ({ date: d, handle: null }));
+  }
+
+  const schedule = [];
+  const failed = [];
+
+  // Her tarih için: tıkla → Hesapla → fiyat al
+  for (const item of dates) {
+    try {
+      // element varsa direkt tıkla; yoksa metne göre arayıp tıkla
+      if (item.handle) {
+        await scrollIntoViewIfNeeded(page, item.handle);
+        await item.handle.click().catch(()=>{});
+      } else {
+        // metne göre yaklaşık tıklama
+        const cand = await page.$x(`//*[contains(normalize-space(.), '${item.date}')]`);
+        if (cand.length) {
+          await scrollIntoViewIfNeeded(page, cand[0]);
+          await cand[0].click().catch(()=>{});
+        }
+      }
+      await sleep(300);
+
+      const pressed = await clickFirstHesapla(page);
+      if (pressed) {
+        // ağ trafiği sakinleşsin
+        if (typeof page.waitForNetworkIdle === "function") {
+          await page.waitForNetworkIdle({ idleTime: 800, timeout: 15000 }).catch(()=>{});
+        }
+        await sleep(600);
+      }
+
+      const price = await extractVisiblePrice(page);
+      if (price) schedule.push({ date: item.date, price });
+      else failed.push({ date: item.date, reason: "price_not_found" });
+    } catch (e) {
+      failed.push({ date: item.date, reason: e.message || "click_error" });
+    }
+
+    // güvenli sınır (çok tarihi olan sayfalarda)
+    if (schedule.length >= 40) break;
+  }
+
+  // sıra ve tekilleştirme
+  const uniqSched = [];
+  const seenKey = new Set();
+  for (const s of schedule) {
+    const k = `${s.date}|${s.price}`;
+    if (!seenKey.has(k)) { seenKey.add(k); uniqSched.push(s); }
+  }
+
+  return { schedule: uniqSched, failed };
+}
+
+// -------- routes ----------
 app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// ---------- keşif: sayfada ne var? ----------
+// debug: sayfada ne bulduk?
 app.get("/probe", async (req, res) => {
   if (!ok(req)) return res.status(401).json({ error: "unauthorized" });
   const url = (req.query.url || "").trim();
@@ -142,69 +222,30 @@ app.get("/probe", async (req, res) => {
 
   let browser;
   try {
-    browser = await launch();
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1366, height: 900 });
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 180000 });
+    ({ browser, page } = await ensurePage(url));
+    const pageAny = await (async () => {
+      const dates = await findLavinyaDateElements(page);
+      const hesaplaButtons = await page.$$eval("button, a, .btn, [role='button']",
+        (nodes) => nodes
+          .map(el => (el.innerText || el.textContent || "").trim().toLowerCase())
+          .filter(t => t.includes("hesapla") || t.includes("fiyat")).length
+      ).catch(()=>0);
 
-    // Çerez kapatma
-    const cookieClicked = await clickByText(page, ["kabul", "kapat", "çerez", "cookie"]);
+      const textDatesCount = await page.evaluate(() => {
+        const t = document.body.innerText || "";
+        return (t.match(/\b([0-3]?\d)\.([0-1]?\d)\.(\d{4})\b/g) || []).length;
+      });
 
-    // 'Tüm Tarihler' butonlarını say
-    const openers = {};
-    for (const label of ["Tüm Tarihler", "Tüm Tarihler ve Fiyatlar", "Tarihler"]) {
-      const count = await page.evaluate((label) => {
-        const all = Array.from(
-          document.querySelectorAll(
-            "button,a,[role='button'],.btn,[class*='btn'],div,span,label"
-          )
-        );
-        return all.filter((el) =>
-          (el.innerText || el.textContent || "").toLowerCase().includes(label.toLowerCase())
-        ).length;
-      }, label);
-      openers[label] = { count };
-    }
+      return { dateNodes: dates.length, textDatesCount, hesaplaButtons };
+    })();
 
-    // Tüm Tarihler’e tıklamayı dene (modal açılacak mı?)
-    const opened = await clickByText(page, ["Tüm Tarihler ve Fiyatlar", "Tüm Tarihler", "Tarihler"]);
-    await sleep(800);
-    const modalPresent = await page.evaluate(() => {
-      return !!document.querySelector(".modal.show,.modal[style*='display: block'],.modal.open,[class*='modal'][aria-hidden='false']");
-    });
-
-    const { handles, hasModal, textNodeProps } = await findDateButtons(page);
-    const hesaplaButtons = await page.evaluate(() => {
-      const all = Array.from(
-        document.querySelectorAll("button,a,[role='button'],.btn,[class*='btn'],div,span,label")
-      );
-      return all.filter((el) => {
-        const t = (el.innerText || el.textContent || "").toLowerCase();
-        return t.includes("hesapla") || t.includes("fiyat");
-      }).length;
-    });
-
-    res.json({
-      ok: true,
-      url,
-      cookieClicked,
-      openers,
-      clickedOpeners: opened,
-      modalPresent,
-      hasModal,
-      modalDateNodes: hasModal ? handles.length : 0,
-      pageDateNodes: !hasModal ? handles.length : 0,
-      textDateNodes: textNodeProps || 0,
-      hesaplaButtons,
-    });
+    res.json({ ok: true, url, ...pageAny });
   } catch (e) {
     res.status(500).json({ error: e.message });
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
+  } finally { if (browser) await browser.close().catch(()=>{}); }
 });
 
-// ---------- asıl akış: tarih → hesapla → fiyat ----------
+// asıl: tarihe tıkla → hesapla → fiyat
 app.get("/calc", async (req, res) => {
   if (!ok(req)) return res.status(401).json({ error: "unauthorized" });
   const url = (req.query.url || "").trim();
@@ -212,112 +253,18 @@ app.get("/calc", async (req, res) => {
 
   let browser;
   try {
-    browser = await launch();
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1366, height: 900 });
-    page.setDefaultTimeout(90000);
+    ({ browser, page } = await ensurePage(url));
+    await scrollToTop(page);
 
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 180000 });
+    const { schedule, failed } = await calcAllDates(page);
 
-    // Çerez kapatma (varsa)
-    await clickByText(page, ["kabul", "kapat", "çerez", "cookie"]);
-    await sleep(400);
-
-    // 1) Tarih/fiyat modalını aç
-    await clickByText(page, ["Tüm Tarihler ve Fiyatlar", "Tüm Tarihler", "Tarihler"]);
-    await sleep(800);
-
-    // 2) Modal (veya sayfa) içinden tarih düğmelerini topla
-    const { handles, hasModal, textNodes } = await findDateButtons(page);
-
-    // 3) Buton/hücre listesinden tıkla → Hesapla/Fiyat → fiyatı al
-    const schedule = [];
-    const failed = [];
-
-    async function pressCalculateAndRead() {
-      const pressed =
-        (await clickByText(page, ["Hesapla", "Fiyat"], hasModal ? ".modal" : null)) ||
-        (await clickByText(page, ["Hesapla", "Fiyat"], null));
-      if (pressed) {
-        try {
-          if (typeof page.waitForNetworkIdle === "function") {
-            await page.waitForNetworkIdle({ idleTime: 800, timeout: 30000 });
-          } else {
-            await sleep(1000);
-          }
-        } catch {}
-      }
-      const price = (await waitPriceText(page)) || "";
-      return price;
-    }
-
-    // a) belirlenen element handle’ları ile (ilk 25 ile sınır)
-    let clicks = 0;
-    for (const h of handles.slice(0, 25)) {
-      try {
-        const label = await page.evaluate((el) => el.innerText || el.getAttribute("data-date") || "", h);
-        const d = normDate(label || "");
-        if (!d) continue;
-
-        await h.click();
-        await sleep(400);
-
-        const price = await pressCalculateAndRead();
-        if (price) schedule.push({ date: d, price });
-        else failed.push({ date: d, reason: "price_not_found" });
-
-        clicks++;
-        if (clicks >= 20) break;
-      } catch {}
-    }
-
-    // b) hâlâ yoksa, metinden bulunan tıklanabilir tarih düğümlerini dene (ilk 15)
-    if (!schedule.length && textNodes) {
-      const count = await page.evaluate((arr) => arr.length, textNodes).catch(() => 0);
-      for (let i = 0; i < Math.min(count, 15); i++) {
-        try {
-          const label = await page.evaluate(
-            (arr, idx) => {
-              const el = arr[idx];
-              return el ? (el.innerText || el.textContent || "") : "";
-            },
-            textNodes,
-            i
-          );
-          const d = normDate(label || "");
-          if (!d) continue;
-
-          await page.evaluate(
-            (arr, idx) => {
-              const el = arr[idx];
-              if (el) el.click();
-            },
-            textNodes,
-            i
-          );
-          await sleep(400);
-
-          const price = await pressCalculateAndRead();
-          if (price) schedule.push({ date: d, price });
-          else failed.push({ date: d, reason: "price_not_found" });
-        } catch {}
-      }
-    }
-
-    res.json({
-      ok: true,
-      url,
-      schedule: uniq(schedule.map((j) => JSON.stringify(j))).map((s) => JSON.parse(s)),
-      failed,
-    });
+    res.json({ ok: true, url, schedule, failed });
   } catch (e) {
     res.status(500).json({ error: e.message });
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
+  } finally { if (browser) await browser.close().catch(()=>{}); }
 });
 
-// ---- dinle ----
+// ---- listen ----
 app.listen(PORT, "0.0.0.0", () => {
-  console.log("✅ Puppeteer servis hazır:", PORT);
+  console.log("✅ Lavinya Puppeteer servisi hazır:", PORT);
 });
