@@ -1,10 +1,10 @@
 # Chrome yüklü resmi Puppeteer imajı
 FROM ghcr.io/puppeteer/puppeteer:latest
 
-# Healthcheck için curl ekle (root ile)
+# İçerden testler için curl (ve sertifikalar) ekle
 USER root
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl \
+  && apt-get install -y --no-install-recommends curl ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 # Uygulama dosyaları
@@ -13,14 +13,13 @@ COPY package.json ./
 RUN npm i --omit=dev
 COPY server.js ./
 
+# Ortam ve ağ
+ENV NODE_ENV=production
 ENV PORT=3000
 EXPOSE 3000
 
-# Docker native healthcheck (Coolify de kullanabilir)
-HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=10 \
-  CMD curl -fs http://localhost:${PORT}/health || exit 1
-
-# Güvenlik için tekrar pptruser'a dön
+# Güvenlik: Puppeteer'ın varsayılan kullanıcısına dön
 USER pptruser
 
+# Uygulamayı başlat
 CMD ["node", "server.js"]
