@@ -1,29 +1,25 @@
-# Chrome yüklü resmi Puppeteer imajı
+# Resmi Puppeteer imajı (Chromium yüklü gelir)
 FROM ghcr.io/puppeteer/puppeteer:latest
 
-# Healthcheck için curl ekle
+# Küçük yardımcılar
 USER root
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl \
+  && apt-get install -y --no-install-recommends curl ca-certificates \
   && rm -rf /var/lib/apt/lists/*
-
-# Chrome’u elle kur (bazı sürümlerde eksik olabiliyor)
-RUN npx puppeteer browsers install chrome
 
 # Uygulama dosyaları
 WORKDIR /app
 COPY package.json ./
-RUN npm install --omit=dev
+RUN npm i --omit=dev
 COPY server.js ./
 
+# Ortam
+ENV NODE_ENV=production
 ENV PORT=3000
 EXPOSE 3000
 
-# Healthcheck (isteğe bağlı)
-HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=10 \
-  CMD curl -fs http://localhost:${PORT}/health || exit 1
-
-# Puppeteer kullanıcısına geri dön
+# Puppeteer default kullanıcısına geri dön
 USER pptruser
 
+# Uygulamayı başlat
 CMD ["node", "server.js"]
