@@ -1,216 +1,164 @@
-const express = require("express");
-const puppeteer = require("puppeteer");
+```javascript
+const express = require('express');
+const puppeteer = require('puppeteer');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const TOKEN = process.env.TOKEN || "";
+const port = process.env.PORT || 3000;
 
-const chromePath =
-  process.env.PUPPETEER_EXECUTABLE_PATH ||
-  (typeof puppeteer.executablePath === "function"
-    ? puppeteer.executablePath()
-    : undefined);
+app.use(express.json());
 
-/* ---------------- helpers ---------------- */
-const ok = (req) =>
-  !TOKEN || req.query.token === TOKEN || req.header("x-token") === TOKEN;
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ ok: true, message: 'Service is running' });
+});
 
-const uniq = (arr) => Array.from(new Set(arr || []));
+// Probe endpoint: Test for presence of key elements like "Tüm Tarihler" button or calendar
+app.post('/probe', async (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ ok: false, error: 'URL is required' });
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--lang=tr-TR,tr;q=0.9,en-US;q=0.8'],
+    });
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-const normDate = (s) => {
-  const m = String(s).match(/\b([0-3]?\d)[./]([0-1]?\d)[./](\d{4})\b/);
-  if (!m) return "";
-  return `${m[1].padStart(2, "0")}.${m[2].padStart(2, "0")}.${m[3]}`;
-};
+    // Check for "Tüm Tarihler" button
+    const tumTarihlerButton = await page.$('button:contains("Tüm Tarihler")') || await page.locator('text="Tüm Tarihler"').elementHandles()[0];
 
-async function launchBrowser() {
-  return puppeteer.launch({
-    headless: true,
-    executablePath: chromePath,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--window-size=1366,900",
-      "--lang=tr-TR",
-    ],
-  });
-}
+    // Check for "Hesapla" button
+    const hesaplaButton = await page.$('button:contains("Hesapla")') || await page.locator('text="Hesapla"').elementHandles()[0];
 
-/** v22+: Metinden buton/anchor bulup tıkla (CSS değil, DOM içi tarama) */
-async function clickByText(page, texts, tags = ["button", "a"]) {
-  for (const txt of texts) {
-    const found = await page.evaluate(
-      (t, tagList) => {
-        const match = (el) => {
-          const s = (el.innerText || el.textContent || "").trim();
-          if (!s) return false;
-          return s.toLowerCase().includes(t.toLowerCase());
+    // Check for calendar
+    const calendar = await page.$('.ui-datepicker-calendar');
+
+    await browser.close();
+
+    res.json({
+      ok: true,
+      url,
+      hasTumTarihler: !!tumTarihlerButton,
+      hasHesapla: !!hesaplaButton,
+      hasCalendar: !!calendar,
+    });
+  } catch (error) {
+    if (browser) await browser.close();
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+// Calc endpoint: Extract dates and prices, interacting if necessary
+app.post('/calc', async (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ ok: false, error: 'URL is required' });
+
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--lang=tr-TR,tr;q=0.9,en-US;q=0.8'],
+    });
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+
+    // Optional: Click "Tüm Tarihler" if exists to load all dates
+    try {
+      const tumTarihler = await page.waitForSelector('text="Tüm Tarihler"', { timeout: 5000 });
+      if (tumTarihler) {
+        await tumTarihler.click();
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 });
+      }
+    } catch {} // Ignore if not found
+
+    // Extract from price table if present
+    const schedule = await page.evaluate(() => {
+      // Find the table with 'Tarih' header
+      const tables = Array.from(document.querySelectorAll('table'));
+      const priceTable = tables.find(table => {
+        const ths = table.querySelectorAll('th');
+        return Array.from(ths).some(th => th.textContent.trim() === 'Tarih' || th.textContent.trim().includes('Tarih'));
+      });
+
+      if (!priceTable) return [];
+
+      const rows = Array.from(priceTable.querySelectorAll('tbody tr'));
+      return rows.map(row => {
+        const cells = row.querySelectorAll('td');
+        if (cells.length < 3) return null;
+
+        const date = cells[0].textContent.trim();
+        const availability = cells[1].textContent.trim();
+        if (availability !== 'Müsait') return null; // Only include available dates
+
+        // Price is in the third cell (İki Kişilik Odada Kişi Başı), take the discounted price after <br>
+        const priceHtml = cells[2].innerHTML;
+        const prices = priceHtml.split('<br>').map(p => p.trim().replace(/[^\d., €₺TL]+/g, ''));
+        const price = prices[1] || prices[0]; // Prefer discounted if available
+
+        return { date, price };
+      }).filter(Boolean);
+    });
+
+    // If no table found, attempt interactive calendar extraction
+    if (schedule.length === 0) {
+      // Assume jQuery UI Datepicker
+      const hasCalendar = await page.$('.ui-datepicker-calendar');
+      if (hasCalendar) {
+        // Get current year (from page or assume 2025)
+        const currentYear = new Date().getFullYear(); // Or parse from page
+
+        // Get month from .ui-datepicker-month
+        const month = await page.evaluate(() => document.querySelector('.ui-datepicker-month')?.textContent.trim());
+
+        // Map month name to number
+        const monthMap = {
+          'Ocak': '01', 'Şubat': '02', 'Mart': '03', 'Nisan': '04', 'Mayıs': '05', 'Haziran': '06',
+          'Temmuz': '07', 'Ağustos': '08', 'Eylül': '09', 'Ekim': '10', 'Kasım': '11', 'Aralık': '12'
         };
-        const visible = (el) => {
-          const st = getComputedStyle(el);
-          const r = el.getBoundingClientRect();
-          return (
-            st &&
-            st.display !== "none" &&
-            st.visibility !== "hidden" &&
-            r.width > 0 &&
-            r.height > 0
-          );
-        };
+        const mm = monthMap[month] || '01';
 
-        const qs = tagList.join(",") + ", *[role='button']";
-        const nodes = document.querySelectorAll(qs);
-        for (const el of nodes) {
-          if (match(el) && visible(el)) {
-            el.click();
-            return true;
+        // Get all available date links
+        const dateElements = await page.$$('.ui-datepicker-calendar td a:not(.ui-state-disabled)');
+
+        for (const dateElem of dateElements) {
+          const day = await page.evaluate(el => el.textContent.trim().padStart(2, '0'), dateElem);
+          const date = `${day}.${mm}.${currentYear}`;
+
+          // Click date
+          await dateElem.click();
+          await page.waitForTimeout(500); // Wait for selection
+
+          // Click Hesapla if exists
+          const hesapla = await page.$('text="Hesapla"');
+          if (hesapla) {
+            await hesapla.click();
+            await page.waitForSelector('.price', { timeout: 5000 }); // Wait for price to load
           }
+
+          // Extract price (assume .price or similar)
+          const price = await page.evaluate(() => {
+            const priceElem = document.querySelector('.price') || document.querySelector('[class*="price"]');
+            return priceElem ? priceElem.textContent.trim() : 'N/A';
+          });
+
+          schedule.push({ date, price });
         }
-        return false;
-      },
-      txt,
-      tags
-    );
-    if (found) return true;
-  }
-  return false;
-}
+      }
+    }
 
-async function getAllDatesAndPricesFromText(page) {
-  const txt = await page.evaluate(() => document.body.innerText || "");
-  const dates = uniq(
-    (txt.match(/\b([0-3]?\d)\.([0-1]?\d)\.(\d{4})\b/g) || []).map(normDate)
-  );
-  const prices = uniq(
-    (txt.match(
-      /(?:₺|\bTL\b)\s*\d{1,3}(?:[.\s]\d{3})*(?:,\d{2})?|\b\d{1,3}(?:[.\s]\d{3})*(?:,\d{2})?\s*(?:TL|₺)\b/gi
-    ) || [])
-      .map((s) => s.replace(/\s+/g, " ").trim())
-      .filter((p) => !/^0+ ?TL$/i.test(p))
-  );
-  return { dates, prices };
-}
+    await browser.close();
 
-/* ---------------- routes ---------------- */
-
-app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
-
-app.get("/probe", async (req, res) => {
-  if (!ok(req)) return res.status(401).json({ error: "unauthorized" });
-  const url = (req.query.url || "").trim();
-  if (!url) return res.status(400).json({ error: "URL eksik" });
-
-  let browser;
-  try {
-    browser = await launchBrowser();
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1366, height: 900 });
-    page.setDefaultTimeout(60000);
-
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 120000 });
-
-    // KVKK kapatmaya çalış
-    await clickByText(page, ["Kabul", "Tamam", "Anladım", "Kapat", "Accept"]);
-    await sleep(400);
-
-    const openers = {
-      "Tüm Tarihler ve Fiyatlar": await page.evaluate(() =>
-        !!Array.from(document.querySelectorAll("*")).find((el) =>
-          (el.innerText || el.textContent || "")
-            .toLowerCase()
-            .includes("tüm tarihler ve fiyatlar")
-        )
-      ),
-      "Tüm Tarihler": await page.evaluate(() =>
-        !!Array.from(document.querySelectorAll("*")).find((el) =>
-          (el.innerText || el.textContent || "")
-            .toLowerCase()
-            .includes("tüm tarihler")
-        )
-      ),
-      "Tarihler": await page.evaluate(() =>
-        !!Array.from(document.querySelectorAll("*")).find((el) =>
-          (el.innerText || el.textContent || "")
-            .toLowerCase()
-            .includes("tarihler")
-        )
-      ),
-      "HESAPLA": await page.evaluate(() =>
-        !!Array.from(document.querySelectorAll("*")).find((el) =>
-          (el.innerText || el.textContent || "")
-            .toLowerCase()
-            .includes("hesapla")
-        )
-      ),
-    };
-
-    const { dates, prices } = await getAllDatesAndPricesFromText(page);
-
-    res.json({
-      ok: true,
-      url,
-      openers,
-      textDateCount: dates.length,
-      sampleDates: dates.slice(0, 6),
-      samplePrices: prices.slice(0, 6),
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  } finally {
-    if (browser) await browser.close().catch(() => {});
+    res.json({ ok: true, url, schedule });
+  } catch (error) {
+    if (browser) await browser.close();
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
-app.get("/calc", async (req, res) => {
-  if (!ok(req)) return res.status(401).json({ error: "unauthorized" });
-  const url = (req.query.url || "").trim();
-  const limit = Number(req.query.limit || 12);
-  if (!url) return res.status(400).json({ error: "URL eksik" });
-
-  let browser;
-  try {
-    browser = await launchBrowser();
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1366, height: 900 });
-    page.setDefaultTimeout(90000);
-
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 180000 });
-
-    // KVKK
-    await clickByText(page, ["Kabul", "Tamam", "Anladım", "Kapat", "Accept"]);
-    await sleep(400);
-
-    // Tarih/fiyat açmaya çalış
-    await clickByText(page, ["Tüm Tarihler ve Fiyatlar", "Tüm Tarihler", "Tarihler"]);
-    await sleep(800);
-
-    // Hesapla
-    await clickByText(page, ["HESAPLA", "Hesapla", "Fiyat"]);
-    await sleep(1200);
-
-    // Şimdilik metinden topla (site-özel tıklama sonraki adım)
-    const { dates, prices } = await getAllDatesAndPricesFromText(page);
-
-    const price = prices[0] || "";
-    const schedule = dates.slice(0, limit).map((d) => ({ date: d, price }));
-
-    res.json({
-      ok: true,
-      url,
-      schedule,
-      note:
-        "Puppeteer v22 uyumlu. Tarih seçiminde siteye özel tıklama adımı bir sonraki patch'te eklenecek.",
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
 });
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("✅ Puppeteer servisi çalışıyor:", PORT);
-});
+```
