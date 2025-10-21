@@ -1,4 +1,3 @@
-```javascript
 const express = require('express');
 const puppeteer = require('puppeteer');
 
@@ -27,22 +26,22 @@ app.post('/probe', async (req, res) => {
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
     // Check for "Tüm Tarihler" button
-    const tumTarihlerButton = await page.$('button:contains("Tüm Tarihler")') || await page.locator('text="Tüm Tarihler"').elementHandles()[0];
+    const tumTarihlerButton = await page.evaluate(() => !!document.querySelector('button, a, [role="button"]')?.textContent.includes('Tüm Tarihler'));
 
     // Check for "Hesapla" button
-    const hesaplaButton = await page.$('button:contains("Hesapla")') || await page.locator('text="Hesapla"').elementHandles()[0];
+    const hesaplaButton = await page.evaluate(() => !!document.querySelector('button, a, [role="button"]')?.textContent.includes('Hesapla'));
 
     // Check for calendar
-    const calendar = await page.$('.ui-datepicker-calendar');
+    const calendar = await page.evaluate(() => !!document.querySelector('.ui-datepicker-calendar'));
 
     await browser.close();
 
     res.json({
       ok: true,
       url,
-      hasTumTarihler: !!tumTarihlerButton,
-      hasHesapla: !!hesaplaButton,
-      hasCalendar: !!calendar,
+      hasTumTarihler: tumTarihlerButton,
+      hasHesapla: hesaplaButton,
+      hasCalendar: calendar,
     });
   } catch (error) {
     if (browser) await browser.close();
@@ -66,16 +65,16 @@ app.post('/calc', async (req, res) => {
 
     // Optional: Click "Tüm Tarihler" if exists to load all dates
     try {
-      const tumTarihler = await page.waitForSelector('text="Tüm Tarihler"', { timeout: 5000 });
-      if (tumTarihler) {
+      const tumTarihler = await page.waitForSelector('button, a, [role="button"]', { timeout: 5000 });
+      const hasTumTarihler = await page.evaluate(el => el.textContent.includes('Tüm Tarihler'), tumTarihler);
+      if (hasTumTarihler) {
         await tumTarihler.click();
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 });
+        await page.waitForTimeout(1000); // Wait for potential load
       }
     } catch {} // Ignore if not found
 
     // Extract from price table if present
-    const schedule = await page.evaluate(() => {
-      // Find the table with 'Tarih' header
+    let schedule = await page.evaluate(() => {
       const tables = Array.from(document.querySelectorAll('table'));
       const priceTable = tables.find(table => {
         const ths = table.querySelectorAll('th');
@@ -91,12 +90,11 @@ app.post('/calc', async (req, res) => {
 
         const date = cells[0].textContent.trim();
         const availability = cells[1].textContent.trim();
-        if (availability !== 'Müsait') return null; // Only include available dates
+        if (availability !== 'Müsait') return null;
 
-        // Price is in the third cell (İki Kişilik Odada Kişi Başı), take the discounted price after <br>
         const priceHtml = cells[2].innerHTML;
         const prices = priceHtml.split('<br>').map(p => p.trim().replace(/[^\d., €₺TL]+/g, ''));
-        const price = prices[1] || prices[0]; // Prefer discounted if available
+        const price = prices[1] || prices[0]; // Prefer discounted price
 
         return { date, price };
       }).filter(Boolean);
@@ -104,11 +102,13 @@ app.post('/calc', async (req, res) => {
 
     // If no table found, attempt interactive calendar extraction
     if (schedule.length === 0) {
-      // Assume jQuery UI Datepicker
-      const hasCalendar = await page.$('.ui-datepicker-calendar');
+      const hasCalendar = await page.evaluate(() => !!document.querySelector('.ui-datepicker-calendar'));
       if (hasCalendar) {
         // Get current year (from page or assume 2025)
-        const currentYear = new Date().getFullYear(); // Or parse from page
+        const currentYear = await page.evaluate(() => {
+          const yearEl = document.querySelector('.ui-datepicker-year');
+          return yearEl ? yearEl.textContent.trim() : '2025';
+        });
 
         // Get month from .ui-datepicker-month
         const month = await page.evaluate(() => document.querySelector('.ui-datepicker-month')?.textContent.trim());
@@ -125,22 +125,25 @@ app.post('/calc', async (req, res) => {
 
         for (const dateElem of dateElements) {
           const day = await page.evaluate(el => el.textContent.trim().padStart(2, '0'), dateElem);
-          const date = `${day}.${mm}.${currentYear}`;
+          const date = day + '.' + mm + '.' + currentYear; // Fixed: Proper string concatenation
 
           // Click date
           await dateElem.click();
           await page.waitForTimeout(500); // Wait for selection
 
           // Click Hesapla if exists
-          const hesapla = await page.$('text="Hesapla"');
+          const hesapla = await page.evaluate(() => {
+            const btn = document.querySelector('button, a, [role="button"]');
+            return btn && btn.textContent.includes('Hesapla') ? btn : null;
+          });
           if (hesapla) {
-            await hesapla.click();
-            await page.waitForSelector('.price', { timeout: 5000 }); // Wait for price to load
+            await page.evaluate(el => el.click(), hesapla);
+            await page.waitForTimeout(1000); // Wait for price to load
           }
 
-          // Extract price (assume .price or similar)
+          // Extract price
           const price = await page.evaluate(() => {
-            const priceElem = document.querySelector('.price') || document.querySelector('[class*="price"]');
+            const priceElem = document.querySelector('.price, [class*="price"]');
             return priceElem ? priceElem.textContent.trim() : 'N/A';
           });
 
@@ -161,4 +164,3 @@ app.post('/calc', async (req, res) => {
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
-```
